@@ -122,6 +122,92 @@ body.focus-mode #quote-container {
   text-shadow: 0 1px 8px rgba(0, 0, 0, 0.45);
 }
 
+/* ── Photo caption + navigation (bottom left) ───────────────── */
+
+#photo-info {
+  position: fixed;
+  bottom: 18px;
+  left: 22px;
+  max-width: min(240px, 20vw);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  transition: opacity 0.5s ease;
+  z-index: 150;
+}
+
+#photo-info.hidden {
+  display: none;
+}
+
+body.focus-mode #photo-info,
+body.awaiting-name #photo-info {
+  opacity: 0;
+  pointer-events: none;
+}
+
+#photo-author {
+  font-size: 12px;
+  font-style: italic;
+  opacity: 0.5;
+  color: inherit;
+  text-decoration: none;
+  line-height: 1.4;
+  letter-spacing: 0.2px;
+  text-shadow: 0 1px 8px rgba(0, 0, 0, 0.5);
+  transition: opacity 0.2s;
+}
+
+#photo-author[href]:hover {
+  opacity: 0.75;
+  text-decoration: underline;
+}
+
+#photo-nav {
+  display: flex;
+  gap: 4px;
+  margin-top: 5px;
+  margin-left: -5px; /* optically align arrows with the text above */
+}
+
+#photo-nav button {
+  background: none;
+  border: none;
+  color: #fff;
+  padding: 3px 5px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  opacity: 0.4;
+  transition: opacity 0.2s;
+}
+
+#photo-nav button:hover:not(:disabled) {
+  opacity: 0.9;
+}
+
+#photo-nav button:disabled {
+  opacity: 0.15;
+  cursor: default;
+}
+
+#photo-info.loading #photo-nav {
+  animation: caption-pulse 1s ease-in-out infinite;
+}
+
+@keyframes caption-pulse {
+  50% { opacity: 0.4; }
+}
+
+/* On narrow windows the centred quote would reach the credit, so lift it. */
+@media (max-width: 1000px) {
+  #quote-container {
+    bottom: 76px;
+  }
+}
+
 /* ── Focus panel (Pomodoro) ─────────────────────────────────── */
 
 #focus-panel {

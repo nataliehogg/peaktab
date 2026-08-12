@@ -92,9 +92,6 @@ const QUOTES = [
   { text: "Life is short, and it's up to you to make it sweet.", author: "Sarah Louise Delany" },
   { text: "Whatever you are, be a good one.", author: "Abraham Lincoln" },
   { text: "I am not afraid of storms, for I am learning how to sail my ship.", author: "Louisa May Alcott" },
-  { text: "It does not do to dwell on dreams and forget to live.", author: "J.K. Rowling" },
-  { text: "It is our choices that show what we truly are, far more than our abilities.", author: "J.K. Rowling" },
-  { text: "Life is either a daring adventure or nothing at all.", author: "Helen Keller" },
   { text: "The purpose of life is to live it, to taste experience to the utmost.", author: "Eleanor Roosevelt" },
   { text: "What you do speaks so loudly that I cannot hear what you say.", author: "Ralph Waldo Emerson" },
   { text: "Do what you can, with what you have, where you are.", author: "Theodore Roosevelt" },
@@ -137,10 +134,32 @@ function dateHash(str) {
 }
 
 // ============================================================
-// BACKGROUND IMAGE — IndexedDB blob cache + pre-fetch
+// BACKGROUND IMAGE — IndexedDB blob cache + pre-fetch + history
+//
+// Cache layout, all in the 'images' store:
+//   "YYYY-MM-DD"       → the deterministic photo of the day
+//   "hist:YYYY-MM-DD"  → array of extra photos skipped to that day
+// Records are { blob, meta }; bare Blobs from older versions are
+// still readable via normalizeRecord().
 // ============================================================
 
 const BG_QUERIES = ['mountains', 'pine forest', 'misty forest', 'rainier', 'pacific northwest', 'waterfall', 'old growth forest', 'evergreen forest', 'mountain lake', 'fog forest', 'ferns', 'nature', 'starry sky', 'trees', 'landscape', 'dolomites', 'alps', 'alpine meadow'];
+
+// Unsplash API guidelines require attribution links carry a UTM tag.
+const UTM = 'utm_source=peaktab&utm_medium=referral';
+
+const HAS_KEY = Boolean(UNSPLASH_ACCESS_KEY) && UNSPLASH_ACCESS_KEY !== 'YOUR_UNSPLASH_ACCESS_KEY_HERE';
+
+// Photos kept per day before the oldest skipped ones are dropped.
+const MAX_HISTORY = 20;
+
+const bgState = {
+  db:        null,
+  items:     [],   // [{ blob, meta }] — items[0] is always the photo of the day
+  index:     0,
+  objectUrl: null,
+  busy:      false,
+};
 
 function tomorrowKey() {
   const d = new Date();
@@ -184,8 +203,34 @@ function dbPurgeOld(db, keepKeys) {
   };
 }
 
-async function fetchImageBlob(dateKey) {
-  const query = BG_QUERIES[dateHash(dateKey) % BG_QUERIES.length];
+function historyKey(dateKey) {
+  return `hist:${dateKey}`;
+}
+
+// The photo of the day is deterministic; skipped-to photos are not.
+function queryForDate(dateKey) {
+  return BG_QUERIES[dateHash(dateKey) % BG_QUERIES.length];
+}
+
+function randomQuery() {
+  return BG_QUERIES[Math.floor(Math.random() * BG_QUERIES.length)];
+}
+
+function extractMeta(data) {
+  return {
+    author: data.user?.name || '',
+    // Links to the photo's own Unsplash page, which names the location.
+    link:   data.links?.html ? `${data.links.html}?${UTM}` : '',
+  };
+}
+
+// Records used to be stored as bare Blobs, before metadata was kept.
+function normalizeRecord(rec) {
+  if (!rec) return null;
+  return rec instanceof Blob ? { blob: rec, meta: null } : rec;
+}
+
+async function fetchImageRecord(query) {
   const res = await fetch(
     `https://api.unsplash.com/photos/random?query=${encodeURIComponent(query)}&orientation=landscape&client_id=${UNSPLASH_ACCESS_KEY}`
   );
@@ -194,49 +239,152 @@ async function fetchImageBlob(dateKey) {
   const physicalW = Math.min(Math.ceil(screen.width * (window.devicePixelRatio || 1)), 6000);
   const url = `${data.urls.raw}&w=${physicalW}&q=95&auto=format`;
   const blob = await fetch(url).then(r => r.blob());
-  return blob;
+  return { blob, meta: extractMeta(data) };
 }
 
 async function prefetchTomorrow(db) {
+  if (!HAS_KEY) return;
   const key = tomorrowKey();
   try {
     if (await dbGet(db, key)) return; // already cached
-    const blob = await fetchImageBlob(key);
-    await dbSet(db, key, blob);
+    await dbSet(db, key, await fetchImageRecord(queryForDate(key)));
   } catch { /* non-fatal */ }
 }
 
-async function loadBackground() {
-  const bgImg = document.getElementById('bg-img');
+// ── Which photo of the day's set is showing (survives new tabs) ──
 
-  let db;
+const BG_INDEX_KEY = 'nb_bg_index';
+
+function savedIndex(dateKey) {
   try {
-    db = await openImageDB();
+    const saved = JSON.parse(localStorage.getItem(BG_INDEX_KEY) || '{}');
+    return saved.date === dateKey ? (saved.index || 0) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function saveIndex(dateKey, index) {
+  localStorage.setItem(BG_INDEX_KEY, JSON.stringify({ date: dateKey, index }));
+}
+
+// ── Caption + navigation ─────────────────────────────────────
+
+function renderPhotoInfo(meta) {
+  const authorEl = document.getElementById('photo-author');
+
+  // Photos cached by older versions carry no metadata; the arrows still work.
+  if (meta?.author) {
+    authorEl.textContent = meta.author;
+    authorEl.hidden      = false;
+    if (meta.link) {
+      authorEl.href = meta.link;
+    } else {
+      authorEl.removeAttribute('href');
+    }
+  } else {
+    authorEl.textContent = '';
+    authorEl.hidden      = true;
+  }
+}
+
+function updateNavButtons() {
+  const atEnd = bgState.index >= bgState.items.length - 1;
+  document.getElementById('photo-prev').disabled = bgState.busy || bgState.index <= 0;
+  document.getElementById('photo-next').disabled = bgState.busy || (atEnd && !HAS_KEY);
+}
+
+function showIndex(i) {
+  const rec = bgState.items[i];
+  if (!rec) return;
+
+  bgState.index = i;
+
+  const previousUrl = bgState.objectUrl;
+  bgState.objectUrl = URL.createObjectURL(rec.blob);
+  document.getElementById('bg-img').style.backgroundImage = `url(${bgState.objectUrl})`;
+  if (previousUrl) URL.revokeObjectURL(previousUrl);
+
+  renderPhotoInfo(rec.meta);
+  document.getElementById('photo-info').classList.remove('hidden');
+  saveIndex(todayKey(), i);
+  updateNavButtons();
+}
+
+async function persistExtras() {
+  try {
+    await dbSet(bgState.db, historyKey(todayKey()), bgState.items.slice(1));
+  } catch { /* non-fatal */ }
+}
+
+function prevPhoto() {
+  if (bgState.busy || bgState.index <= 0) return;
+  showIndex(bgState.index - 1);
+}
+
+async function nextPhoto() {
+  if (bgState.busy) return;
+
+  // Already have one further along — just step forward.
+  if (bgState.index < bgState.items.length - 1) {
+    showIndex(bgState.index + 1);
+    return;
+  }
+
+  if (!HAS_KEY) return;
+
+  bgState.busy = true;
+  document.getElementById('photo-info').classList.add('loading');
+  updateNavButtons();
+
+  try {
+    const rec = await fetchImageRecord(randomQuery());
+    bgState.items.push(rec);
+    // Keep the photo of the day at [0]; drop the oldest skipped ones.
+    if (bgState.items.length > MAX_HISTORY) {
+      bgState.items.splice(1, bgState.items.length - MAX_HISTORY);
+    }
+    await persistExtras();
+    showIndex(bgState.items.length - 1);
+  } catch (err) {
+    console.error('[newtab] could not load the next photo:', err);
+  } finally {
+    bgState.busy = false;
+    document.getElementById('photo-info').classList.remove('loading');
+    updateNavButtons();
+  }
+}
+
+async function loadBackground() {
+  try {
+    bgState.db = await openImageDB();
   } catch (err) {
     console.error('[newtab] IndexedDB unavailable:', err);
     return;
   }
 
   const today = todayKey();
-  dbPurgeOld(db, [today, tomorrowKey()]);
+  dbPurgeOld(bgState.db, [today, tomorrowKey(), historyKey(today)]);
 
-  let blob = await dbGet(db, today);
+  let base = normalizeRecord(await dbGet(bgState.db, today));
 
-  if (!blob) {
-    if (UNSPLASH_ACCESS_KEY === 'YOUR_UNSPLASH_ACCESS_KEY_HERE') return;
+  if (!base) {
+    if (!HAS_KEY) return;
     try {
-      blob = await fetchImageBlob(today);
-      await dbSet(db, today, blob);
+      base = await fetchImageRecord(queryForDate(today));
+      await dbSet(bgState.db, today, base);
     } catch (err) {
       console.error('[newtab] Unsplash load failed:', err);
       return;
     }
   }
 
-  const blobUrl = URL.createObjectURL(blob);
-  bgImg.style.backgroundImage = `url(${blobUrl})`;
+  const extras = (await dbGet(bgState.db, historyKey(today))) || [];
+  bgState.items = [base, ...extras.map(normalizeRecord).filter(Boolean)];
 
-  prefetchTomorrow(db);
+  showIndex(Math.min(savedIndex(today), bgState.items.length - 1));
+
+  prefetchTomorrow(bgState.db);
 }
 
 // ============================================================
@@ -542,6 +690,9 @@ const _fontLink = document.createElement('link');
 _fontLink.rel = 'stylesheet';
 _fontLink.href = 'https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,700;1,400&display=swap';
 document.head.appendChild(_fontLink);
+
+document.getElementById('photo-prev').addEventListener('click', prevPhoto);
+document.getElementById('photo-next').addEventListener('click', nextPhoto);
 
 loadBackground();
 loadQuote();
