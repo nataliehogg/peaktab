@@ -4,7 +4,7 @@
   "version": "1.3",
   "description": "Daily photo, time, quote, and Pomodoro focus mode.",
   "icons": {
-    "128": "icon.png"
+    "1024": "icon.png"
   },
   "chrome_url_overrides": {
     "newtab": "newtab.html"

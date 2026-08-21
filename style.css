@@ -512,3 +512,12 @@ body.awaiting-name #focus-toggle {
 #focus-toggle:hover {
   opacity: 1;
 }
+
+/* Starting state for the swapped icon pairs. It lives here rather than in a
+   style attribute because the extension CSP has no 'unsafe-inline', so inline
+   styles in the markup are dropped and both icons of a pair would show. The
+   click handlers then set element.style directly, which CSP does allow. */
+#icon-close,
+#icon-pause {
+  display: none;
+}

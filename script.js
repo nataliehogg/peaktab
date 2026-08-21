@@ -423,13 +423,15 @@ function loadQuote() {
 
 let focusMode = false;
 
-const ICON_MOUNTAIN = `<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="4" cy="4" r="2"/><path d="m14 5 3-3 3 3"/><path d="m14 10 3-3 3 3"/><path d="M17 14V2"/><path d="M17 14H7l-5 8h20Z"/><path d="M8 14v8"/><path d="m9 14 5 8"/></svg>`;
-const ICON_CLOSE    = `<svg width="16" height="16" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5" fill="none"><line x1="4" y1="4" x2="20" y2="20"/><line x1="20" y1="4" x2="4" y2="20"/></svg>`;
-
+// Both icons live in the markup and are swapped by visibility, the same way
+// the play/pause icons are — no markup is built from strings at runtime.
+// The close icon starts hidden via style.css, not a style attribute; see the
+// note there about the extension CSP.
 document.getElementById('focus-toggle').addEventListener('click', () => {
   focusMode = !focusMode;
   document.body.classList.toggle('focus-mode', focusMode);
-  document.getElementById('focus-toggle').innerHTML = focusMode ? ICON_CLOSE : ICON_MOUNTAIN;
+  document.getElementById('icon-mountain').style.display = focusMode ? 'none' : 'inline';
+  document.getElementById('icon-close').style.display    = focusMode ? 'inline' : 'none';
 });
 
 // ============================================================
@@ -548,13 +550,12 @@ function renderDots() {
   // Focus panel
   const container = document.getElementById('streak-dots');
   const label     = document.getElementById('streak-count');
-  container.innerHTML = '';
-  container.appendChild(makeDots(count));
+  container.replaceChildren(makeDots(count));
   label.textContent = count > 0 ? `${count} pomodoro${count === 1 ? '' : 's'} today` : '';
 
   // Main page
   const main = document.getElementById('streak-main');
-  main.innerHTML = '';
+  main.replaceChildren();
   if (count === 0) {
     const empty = document.createElement('div');
     empty.className = 'dot-empty';
