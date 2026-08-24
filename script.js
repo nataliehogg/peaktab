@@ -1,11 +1,20 @@
 'use strict';
 
 // ============================================================
-// CONFIGURATION — add your Unsplash Access Key here.
-// Get one free at: https://unsplash.com/developers
+// CONFIGURATION
+//
+// The Unsplash access key is deliberately not in this file. Copy
+// config.example.js to config.js and put yours there — config.js is
+// gitignored. Failing that, set it once from the console:
+//   localStorage.setItem('nb_unsplash_key', 'your-key')
+//
 // Without a key the background falls back to a gradient.
 // ============================================================
-const UNSPLASH_ACCESS_KEY = 'cXAiHOTB8pYKNXODphDHejGyBWxw1t4aBXYX6Qe5mkw';
+const UNSPLASH_ACCESS_KEY =
+  (typeof PEAKTAB_CONFIG !== 'undefined' && PEAKTAB_CONFIG.unsplashAccessKey) ||
+  localStorage.getItem('nb_unsplash_key') ||
+  '';
+
 const NAME_KEY = 'nb_name';
 
 function getName() {
@@ -136,11 +145,14 @@ function dateHash(str) {
 // ============================================================
 // BACKGROUND IMAGE — IndexedDB blob cache + pre-fetch + history
 //
-// Cache layout, all in the 'images' store:
+// Cache layout, in the 'images' store:
 //   "YYYY-MM-DD"       → the deterministic photo of the day
 //   "hist:YYYY-MM-DD"  → array of extra photos skipped to that day
 // Records are { blob, meta }; bare Blobs from older versions are
 // still readable via normalizeRecord().
+//
+// The 'favourites' store is keyed by Unsplash photo id and is never
+// purged: { id, blob, thumb, meta, addedAt }.
 // ============================================================
 
 const BG_QUERIES = ['mountains', 'pine forest', 'misty forest', 'rainier', 'pacific northwest', 'waterfall', 'old growth forest', 'evergreen forest', 'mountain lake', 'fog forest', 'ferns', 'nature', 'starry sky', 'trees', 'landscape', 'dolomites', 'alps', 'alpine meadow'];
@@ -153,12 +165,19 @@ const HAS_KEY = Boolean(UNSPLASH_ACCESS_KEY) && UNSPLASH_ACCESS_KEY !== 'YOUR_UN
 // Photos kept per day before the oldest skipped ones are dropped.
 const MAX_HISTORY = 20;
 
+// One request to /photos/random?count=N returns N descriptions but costs a
+// single call against the rate limit, and only the winner's pixels are
+// downloaded — so ranking a pool is very nearly free.
+const CANDIDATE_COUNT = 8;
+
 const bgState = {
   db:        null,
   items:     [],   // [{ blob, meta }] — items[0] is always the photo of the day
   index:     0,
   objectUrl: null,
   busy:      false,
+  favIds:    new Set(),
+  shownAt:   0,    // when the current photo went up, for the skip signal
 };
 
 function tomorrowKey() {
@@ -169,25 +188,48 @@ function tomorrowKey() {
 
 function openImageDB() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open('newtab_bg', 1);
-    req.onupgradeneeded = e => e.target.result.createObjectStore('images');
+    // v2 added the favourites store; v1 databases are upgraded in place.
+    const req = indexedDB.open('newtab_bg', 2);
+    req.onupgradeneeded = e => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains('images'))     db.createObjectStore('images');
+      if (!db.objectStoreNames.contains('favourites')) db.createObjectStore('favourites', { keyPath: 'id' });
+    };
     req.onsuccess = e => resolve(e.target.result);
     req.onerror = () => reject(req.error);
   });
 }
 
-function dbGet(db, key) {
+function dbGet(db, key, store = 'images') {
   return new Promise((resolve, reject) => {
-    const req = db.transaction('images', 'readonly').objectStore('images').get(key);
+    const req = db.transaction(store, 'readonly').objectStore(store).get(key);
     req.onsuccess = () => resolve(req.result ?? null);
     req.onerror = () => reject(req.error);
   });
 }
 
-function dbSet(db, key, value) {
+function dbSet(db, key, value, store = 'images') {
   return new Promise((resolve, reject) => {
-    const req = db.transaction('images', 'readwrite').objectStore('images').put(value, key);
+    const os = db.transaction(store, 'readwrite').objectStore(store);
+    // Stores with a keyPath (favourites) reject an explicit key.
+    const req = os.keyPath ? os.put(value) : os.put(value, key);
     req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function dbDelete(db, key, store) {
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(store, 'readwrite').objectStore(store).delete(key);
+    req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function dbGetAll(db, store) {
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(store, 'readonly').objectStore(store).getAll();
+    req.onsuccess = () => resolve(req.result || []);
     req.onerror = () => reject(req.error);
   });
 }
@@ -207,6 +249,127 @@ function historyKey(dateKey) {
   return `hist:${dateKey}`;
 }
 
+// ============================================================
+// TASTE MODEL
+//
+// Every photo is reduced to a bag of features (its search term, tags,
+// photographer, colour). Favouriting adds weight to that photo's features,
+// skipping quickly past one subtracts a little, and weights decay daily so
+// taste can drift. Candidates are then ranked by the weight they inherit.
+//
+// Entirely local: a small JSON blob in localStorage, nothing leaves the tab.
+// ============================================================
+
+const PREFS_KEY = 'nb_prefs';
+
+const LEARN_FAV     = 1.0;    // added per feature when a photo is favourited
+const LEARN_SKIP    = 0.12;   // removed when a photo is skipped past quickly
+const SKIP_WINDOW_MS = 6000;  // longer than this and it isn't really a rejection
+const WEIGHT_CAP    = 4;      // stops any one feature dominating for ever
+const DECAY_PER_DAY = 0.97;
+const MIN_WEIGHT    = 0.05;   // below this a feature is forgotten entirely
+const EXPLORE_RATE  = 0.15;   // pick at random this often, to avoid a filter bubble
+const QUERY_TEMP    = 1.5;    // softmax temperature for search-term choice
+
+function emptyPrefs() {
+  return { v: 1, updated: todayKey(), f: {} };
+}
+
+function daysBetween(fromKey, toKey) {
+  const ms = Date.parse(`${toKey}T00:00:00`) - Date.parse(`${fromKey}T00:00:00`);
+  return Number.isFinite(ms) ? Math.max(0, Math.round(ms / 86400000)) : 0;
+}
+
+// Read the model, applying any decay owed since it was last touched.
+function loadPrefs() {
+  let prefs;
+  try {
+    prefs = JSON.parse(localStorage.getItem(PREFS_KEY) || 'null');
+  } catch {
+    prefs = null;
+  }
+  if (!prefs || prefs.v !== 1 || typeof prefs.f !== 'object' || !prefs.f) return emptyPrefs();
+
+  const today = todayKey();
+  const days  = daysBetween(prefs.updated || today, today);
+  if (days > 0) {
+    const factor = DECAY_PER_DAY ** days;
+    for (const [key, weight] of Object.entries(prefs.f)) {
+      const decayed = weight * factor;
+      if (Math.abs(decayed) < MIN_WEIGHT) delete prefs.f[key];
+      else prefs.f[key] = decayed;
+    }
+    prefs.updated = today;
+    savePrefs(prefs);
+  }
+  return prefs;
+}
+
+function savePrefs(prefs) {
+  try {
+    localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
+  } catch { /* quota or private mode — the model is a nicety, not essential */ }
+}
+
+function hexToHsl(hex) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex || '');
+  if (!m) return null;
+  const n = parseInt(m[1], 16);
+  const r = ((n >> 16) & 255) / 255, g = ((n >> 8) & 255) / 255, b = (n & 255) / 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+  let h = 0;
+  if (d !== 0) {
+    if (max === r)      h = ((g - b) / d + (g < b ? 6 : 0));
+    else if (max === g) h = ((b - r) / d + 2);
+    else                h = ((r - g) / d + 4);
+    h *= 60;
+  }
+  return { h, s: max === 0 ? 0 : d / max, l: (max + min) / 2 };
+}
+
+function colourFeatures(hex) {
+  const hsl = hexToHsl(hex);
+  if (!hsl) return [];
+  const tone = hsl.l < 0.3 ? 'dark' : hsl.l > 0.65 ? 'light' : 'mid';
+  const out  = [`tone:${tone}`];
+  // Hue is meaningless on near-greys, so only bucket it when there's colour.
+  if (hsl.s > 0.15) out.push(`hue:${Math.floor(hsl.h / 30) * 30}`);
+  return out;
+}
+
+function featuresOf(meta) {
+  if (!meta) return [];
+  const out = [];
+  if (meta.query)    out.push(`query:${meta.query}`);
+  if (meta.username) out.push(`author:${meta.username}`);
+  for (const tag of meta.tags   || []) out.push(`tag:${tag}`);
+  for (const top of meta.topics || []) out.push(`topic:${top}`);
+  out.push(...colourFeatures(meta.color));
+  return out;
+}
+
+// Divided by sqrt(n) so a heavily tagged photo can't win on volume alone.
+function scoreMeta(meta, prefs) {
+  const features = featuresOf(meta);
+  if (!features.length) return 0;
+  let total = 0;
+  for (const feature of features) total += prefs.f[feature] || 0;
+  return total / Math.sqrt(features.length);
+}
+
+function learn(meta, delta) {
+  const features = featuresOf(meta);
+  if (!features.length || !delta) return;
+  const prefs = loadPrefs();
+  for (const feature of features) {
+    const weight = Math.max(-WEIGHT_CAP, Math.min(WEIGHT_CAP, (prefs.f[feature] || 0) + delta));
+    if (Math.abs(weight) < MIN_WEIGHT) delete prefs.f[feature];
+    else prefs.f[feature] = weight;
+  }
+  prefs.updated = todayKey();
+  savePrefs(prefs);
+}
+
 // The photo of the day is deterministic; skipped-to photos are not.
 function queryForDate(dateKey) {
   return BG_QUERIES[dateHash(dateKey) % BG_QUERIES.length];
@@ -216,11 +379,36 @@ function randomQuery() {
   return BG_QUERIES[Math.floor(Math.random() * BG_QUERIES.length)];
 }
 
-function extractMeta(data) {
+// Softmax over the learned per-term weights. With an untrained model every
+// term has weight 0, so this is exactly uniform — same behaviour as before.
+function preferredQuery() {
+  if (Math.random() < EXPLORE_RATE) return randomQuery();
+
+  const prefs   = loadPrefs();
+  const weights = BG_QUERIES.map(q => Math.exp((prefs.f[`query:${q}`] || 0) / QUERY_TEMP));
+  const total   = weights.reduce((a, b) => a + b, 0);
+  if (!Number.isFinite(total) || total <= 0) return randomQuery();
+
+  let roll = Math.random() * total;
+  for (let i = 0; i < BG_QUERIES.length; i++) {
+    roll -= weights[i];
+    if (roll <= 0) return BG_QUERIES[i];
+  }
+  return BG_QUERIES[BG_QUERIES.length - 1];
+}
+
+function extractMeta(data, query) {
   return {
+    id:     data.id || '',
     author: data.user?.name || '',
     // Links to the photo's own Unsplash page, which names the location.
     link:   data.links?.html ? `${data.links.html}?${UTM}` : '',
+    // Kept for the taste model rather than for display.
+    query:    query || '',
+    username: data.user?.username || '',
+    color:    data.color || '',
+    tags:   (data.tags || []).map(t => (t.title || '').toLowerCase()).filter(Boolean).slice(0, 10),
+    topics: Object.keys(data.topic_submissions || {}),
   };
 }
 
@@ -230,16 +418,53 @@ function normalizeRecord(rec) {
   return rec instanceof Blob ? { blob: rec, meta: null } : rec;
 }
 
-async function fetchImageRecord(query) {
+async function fetchCandidates(query, count) {
   const res = await fetch(
-    `https://api.unsplash.com/photos/random?query=${encodeURIComponent(query)}&orientation=landscape&client_id=${UNSPLASH_ACCESS_KEY}`
+    `https://api.unsplash.com/photos/random?query=${encodeURIComponent(query)}` +
+    `&orientation=landscape&count=${count}&client_id=${UNSPLASH_ACCESS_KEY}`
   );
   if (!res.ok) throw new Error(`Unsplash ${res.status}: ${await res.text()}`);
   const data = await res.json();
+  // The endpoint returns a bare object when count is absent or 1.
+  const list = Array.isArray(data) ? data : [data];
+  if (!list.length) throw new Error('Unsplash returned no photos');
+  return list;
+}
+
+// Highest scoring candidate, except that EXPLORE_RATE of the time we take a
+// random one so the model keeps seeing things it hasn't already endorsed.
+function pickCandidate(candidates, query) {
+  const seen  = new Set(bgState.items.map(item => item.meta?.id).filter(Boolean));
+  const fresh = candidates.filter(c => !seen.has(c.id));
+  const pool  = fresh.length ? fresh : candidates;
+
+  if (pool.length === 1 || Math.random() < EXPLORE_RATE) {
+    return pool[Math.floor(Math.random() * pool.length)];
+  }
+
+  const prefs = loadPrefs();
+  let best = pool[0];
+  let bestScore = -Infinity;
+  for (const candidate of pool) {
+    const score = scoreMeta(extractMeta(candidate, query), prefs);
+    if (score > bestScore) {
+      bestScore = score;
+      best = candidate;
+    }
+  }
+  return best;
+}
+
+async function downloadRecord(data, query) {
   const physicalW = Math.min(Math.ceil(screen.width * (window.devicePixelRatio || 1)), 6000);
   const url = `${data.urls.raw}&w=${physicalW}&q=95&auto=format`;
   const blob = await fetch(url).then(r => r.blob());
-  return { blob, meta: extractMeta(data) };
+  return { blob, meta: extractMeta(data, query) };
+}
+
+async function fetchImageRecord(query) {
+  const candidates = await fetchCandidates(query, CANDIDATE_COUNT);
+  return downloadRecord(pickCandidate(candidates, query), query);
 }
 
 async function prefetchTomorrow(db) {
@@ -249,6 +474,200 @@ async function prefetchTomorrow(db) {
     if (await dbGet(db, key)) return; // already cached
     await dbSet(db, key, await fetchImageRecord(queryForDate(key)));
   } catch { /* non-fatal */ }
+}
+
+// ============================================================
+// FAVOURITES
+//
+// Favourites are pinned in their own store, so dbPurgeOld never touches
+// them, and are only ever shown again when picked from the gallery — the
+// day's background always starts as something new.
+// ============================================================
+
+const THUMB_WIDTH = 480;
+
+// Full-size backgrounds are far too heavy to decode a gridful of, so each
+// favourite carries a small JPEG copy for the gallery.
+async function makeThumb(blob) {
+  try {
+    const bitmap = await createImageBitmap(blob);
+    const height = Math.max(1, Math.round(bitmap.height * (THUMB_WIDTH / bitmap.width)));
+    const canvas = new OffscreenCanvas(THUMB_WIDTH, height);
+    canvas.getContext('2d').drawImage(bitmap, 0, 0, THUMB_WIDTH, height);
+    bitmap.close();
+    return await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.8 });
+  } catch {
+    return null; // the gallery falls back to the full image
+  }
+}
+
+function currentRecord() {
+  return bgState.items[bgState.index] || null;
+}
+
+function currentPhotoId() {
+  return currentRecord()?.meta?.id || '';
+}
+
+function updateFavButton() {
+  const button = document.getElementById('photo-fav');
+  const id     = currentPhotoId();
+  // Photos cached before this version carry no id, so they can't be pinned.
+  button.disabled = !id || bgState.busy;
+  button.setAttribute('aria-pressed', String(bgState.favIds.has(id)));
+  button.setAttribute('aria-label', bgState.favIds.has(id) ? 'Remove from favourites' : 'Add to favourites');
+}
+
+async function addFavourite(rec) {
+  const id = rec?.meta?.id;
+  if (!id) return;
+  await dbSet(bgState.db, id, {
+    id,
+    blob:    rec.blob,
+    thumb:   await makeThumb(rec.blob),
+    meta:    rec.meta,
+    addedAt: Date.now(),
+  }, 'favourites');
+  bgState.favIds.add(id);
+  learn(rec.meta, LEARN_FAV);
+}
+
+async function removeFavourite(id) {
+  await dbDelete(bgState.db, id, 'favourites');
+  bgState.favIds.delete(id);
+  // Undo roughly what favouriting added, rather than punishing the photo.
+  const rec = bgState.items.find(item => item.meta?.id === id);
+  if (rec) learn(rec.meta, -LEARN_FAV);
+}
+
+async function toggleFavourite() {
+  const rec = currentRecord();
+  const id  = rec?.meta?.id;
+  if (!bgState.db || !id) return;
+
+  try {
+    if (bgState.favIds.has(id)) await removeFavourite(id);
+    else                        await addFavourite(rec);
+  } catch (err) {
+    console.error('[newtab] could not update favourites:', err);
+  }
+  updateFavButton();
+}
+
+// ── Gallery ──────────────────────────────────────────────────
+
+const galleryUrls = [];
+
+function releaseGalleryUrls() {
+  while (galleryUrls.length) URL.revokeObjectURL(galleryUrls.pop());
+}
+
+function makeFavTile(fav) {
+  const tile = document.createElement('div');
+  tile.className = 'fav-item';
+
+  const pick = document.createElement('button');
+  pick.className = 'fav-pick';
+  pick.setAttribute('aria-label', fav.meta?.author ? `Use photo by ${fav.meta.author}` : 'Use this photo');
+
+  const url = URL.createObjectURL(fav.thumb || fav.blob);
+  galleryUrls.push(url);
+
+  const img = document.createElement('img');
+  img.src = url;
+  img.alt = '';
+  img.loading = 'lazy';
+  pick.appendChild(img);
+  pick.addEventListener('click', () => useFavourite(fav.id));
+  tile.appendChild(pick);
+
+  const remove = document.createElement('button');
+  remove.className = 'fav-remove';
+  remove.setAttribute('aria-label', 'Remove from favourites');
+  remove.textContent = '×';
+  remove.addEventListener('click', async () => {
+    await removeFavourite(fav.id);
+    updateFavButton();
+    renderGallery();
+  });
+  tile.appendChild(remove);
+
+  return tile;
+}
+
+async function renderGallery() {
+  const inner = document.getElementById('gallery-inner');
+  releaseGalleryUrls();
+
+  let favourites = [];
+  try {
+    favourites = await dbGetAll(bgState.db, 'favourites');
+  } catch (err) {
+    console.error('[newtab] could not read favourites:', err);
+  }
+  favourites.sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0));
+
+  const frag = document.createDocumentFragment();
+
+  const title = document.createElement('div');
+  title.id = 'gallery-title';
+  title.textContent = favourites.length
+    ? `Favourites · ${favourites.length}`
+    : 'Favourites';
+  frag.appendChild(title);
+
+  if (!favourites.length) {
+    const empty = document.createElement('p');
+    empty.id = 'gallery-empty';
+    empty.textContent = 'No favourites yet. Press the heart on a photo you like and it will be kept here.';
+    frag.appendChild(empty);
+  } else {
+    const grid = document.createElement('div');
+    grid.id = 'gallery-grid';
+    for (const fav of favourites) grid.appendChild(makeFavTile(fav));
+    frag.appendChild(grid);
+  }
+
+  inner.replaceChildren(frag);
+}
+
+// Put a favourite up as today's background. It joins the day's set, so it
+// survives into new tabs and the arrows still walk back to the others.
+async function useFavourite(id) {
+  closeGallery();
+  if (!bgState.db) return;
+
+  const existing = bgState.items.findIndex(item => item.meta?.id === id);
+  if (existing !== -1) {
+    showIndex(existing);
+    return;
+  }
+
+  try {
+    const fav = await dbGet(bgState.db, id, 'favourites');
+    if (!fav) return;
+    bgState.items.push({ blob: fav.blob, meta: fav.meta });
+    if (bgState.items.length > MAX_HISTORY) {
+      bgState.items.splice(1, bgState.items.length - MAX_HISTORY);
+    }
+    await persistExtras();
+    showIndex(bgState.items.length - 1);
+  } catch (err) {
+    console.error('[newtab] could not load that favourite:', err);
+  }
+}
+
+function openGallery() {
+  if (!bgState.db) return;
+  document.getElementById('gallery-popup').classList.remove('hidden');
+  document.getElementById('modal-backdrop').classList.remove('hidden');
+  renderGallery();
+}
+
+function closeGallery() {
+  document.getElementById('gallery-popup').classList.add('hidden');
+  document.getElementById('modal-backdrop').classList.add('hidden');
+  releaseGalleryUrls();
 }
 
 // ── Which photo of the day's set is showing (survives new tabs) ──
@@ -292,6 +711,7 @@ function updateNavButtons() {
   const atEnd = bgState.index >= bgState.items.length - 1;
   document.getElementById('photo-prev').disabled = bgState.busy || bgState.index <= 0;
   document.getElementById('photo-next').disabled = bgState.busy || (atEnd && !HAS_KEY);
+  updateFavButton();
 }
 
 function showIndex(i) {
@@ -308,6 +728,7 @@ function showIndex(i) {
   renderPhotoInfo(rec.meta);
   document.getElementById('photo-info').classList.remove('hidden');
   saveIndex(todayKey(), i);
+  bgState.shownAt = Date.now();
   updateNavButtons();
 }
 
@@ -322,8 +743,20 @@ function prevPhoto() {
   showIndex(bgState.index - 1);
 }
 
+// Moving on within a few seconds reads as "not this one". It's a noisy
+// signal — the user may just be browsing — so it counts for much less than
+// a favourite, and a photo they've already pinned is never punished.
+function registerSkip() {
+  const rec = currentRecord();
+  if (!rec || Date.now() - bgState.shownAt > SKIP_WINDOW_MS) return;
+  if (rec.meta?.id && bgState.favIds.has(rec.meta.id)) return;
+  learn(rec.meta, -LEARN_SKIP);
+}
+
 async function nextPhoto() {
   if (bgState.busy) return;
+
+  registerSkip();
 
   // Already have one further along — just step forward.
   if (bgState.index < bgState.items.length - 1) {
@@ -338,7 +771,7 @@ async function nextPhoto() {
   updateNavButtons();
 
   try {
-    const rec = await fetchImageRecord(randomQuery());
+    const rec = await fetchImageRecord(preferredQuery());
     bgState.items.push(rec);
     // Keep the photo of the day at [0]; drop the oldest skipped ones.
     if (bgState.items.length > MAX_HISTORY) {
@@ -365,6 +798,11 @@ async function loadBackground() {
 
   const today = todayKey();
   dbPurgeOld(bgState.db, [today, tomorrowKey(), historyKey(today)]);
+
+  try {
+    const favourites = await dbGetAll(bgState.db, 'favourites');
+    bgState.favIds = new Set(favourites.map(f => f.id));
+  } catch { /* the heart just stays unlit */ }
 
   let base = normalizeRecord(await dbGet(bgState.db, today));
 
@@ -644,19 +1082,28 @@ function buildCalendar() {
 function openCalendar() {
   document.getElementById('calendar-inner').replaceChildren(buildCalendar());
   document.getElementById('calendar-popup').classList.remove('hidden');
-  document.getElementById('calendar-backdrop').classList.remove('hidden');
+  document.getElementById('modal-backdrop').classList.remove('hidden');
 }
 
 function closeCalendar() {
   document.getElementById('calendar-popup').classList.add('hidden');
-  document.getElementById('calendar-backdrop').classList.add('hidden');
+  document.getElementById('modal-backdrop').classList.add('hidden');
+}
+
+// One backdrop serves both popups, so it dismisses whichever is open.
+function closePopups() {
+  closeCalendar();
+  closeGallery();
 }
 
 document.getElementById('streak-main').addEventListener('click', openCalendar);
 document.getElementById('streak-main').addEventListener('keydown', e => {
   if (e.key === 'Enter' || e.key === ' ') openCalendar();
 });
-document.getElementById('calendar-backdrop').addEventListener('click', closeCalendar);
+document.getElementById('modal-backdrop').addEventListener('click', closePopups);
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closePopups();
+});
 
 // ============================================================
 // NAME PROMPT (first run)
@@ -694,6 +1141,8 @@ document.head.appendChild(_fontLink);
 
 document.getElementById('photo-prev').addEventListener('click', prevPhoto);
 document.getElementById('photo-next').addEventListener('click', nextPhoto);
+document.getElementById('photo-fav').addEventListener('click', toggleFavourite);
+document.getElementById('photo-gallery').addEventListener('click', openGallery);
 
 loadBackground();
 loadQuote();
